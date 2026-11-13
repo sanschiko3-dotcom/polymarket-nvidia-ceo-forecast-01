@@ -1,31 +1,39 @@
-// polymarket-nvidia-ceo-forecast-01 entry v1 (Node 22, standard library only).
+// polymarket-nvidia-ceo-forecast-01 entry v2 (Node 22, standard library only).
 //
 // Forecaster: per-market EMPIRICAL quantiles of past h-step price changes,
-// shrunk 70% toward zero width.
+// shrunk toward zero width with a PER-TAU, ASYMMETRIC shrinkage.
 //
 // For each market, take its last 24 hours of minute prices (1,440 points) and,
 // for a log-spaced grid of horizons h, collect every overlapping h-minute price
-// change, take its 5% / 25% / 50% / 75% / 95% quantiles, keep only 30% of each
-// (SHRINK = 0.7), and interpolate in log h. The forecast for minute at+h is
+// change, take its 5% / 25% / 50% / 75% / 95% quantiles, shrink each toward zero
+// by its own factor, and interpolate in log h. The forecast for minute at+h is
 //   q_tau(h) = clamp(last price + shrunk empirical quantile_tau(h), 0, 1).
 //
-// Why this shape, not the house baseline's normal random walk:
-// Polymarket Yes prices sit still most minutes (88% of 1-minute moves are
-// exactly zero) and then jump, sometimes by 0.4 in a minute, and the jumps are
-// asymmetric (big falls are far more common than big rises in this event's
-// history). A normal with a volatility matched to the return standard deviation
-// is far too wide in the middle and pays pinball loss at every quiet minute.
-// The empirical quantiles are narrow in the centre (most mass at zero change)
-// and fat in the tails, which is what the data actually looks like — but the
-// raw empirical quantiles still overstate the conditional dispersion (the
-// history window contains regime shifts, and overlapping samples double-count
-// jumps), so shrinking them toward zero helps: on the six practice cases the
-// loss falls from 0.3524 at shrink 0.2 to 0.3232 at shrink 0.7, with a broad
-// flat minimum at 0.6-0.8 (0.3250 / 0.3232 / 0.3266), while pure persistence
-// (shrink 1.0) is much worse at 0.3838 — so some width is genuinely needed.
-// Backtest on the six practice cases (ground truth: next case's prices, p05's
-// fetched from Polymarket's public price history): mean pinball loss 0.3232
-// against the house baseline's 0.3636.
+// Why asymmetric: the price changes are not symmetric. Big falls are far more
+// common than big rises in this event's history, and a 1-minute rise of 0.02+ is
+// followed by a strong downward drift over the next 4 hours (pooled mean -0.14
+// at 240 minutes), while a fall of the same size is followed by almost nothing.
+// So the lower tail is kept wide (it is real, persistent dispersion) and the
+// upper tail is shrunk hard (rises revert): SHRINK = [0.35, 0.80, 0.85, 0.90,
+// 0.70] for tau = 0.05, 0.25, 0.50, 0.75, 0.95. The middle quantiles are
+// shrunk hardest of all because most mass sits at zero change (88% of 1-minute
+// moves are exactly zero), so the raw empirical mid quantiles still overstate
+// the conditional dispersion. The median is shrunk 0.85 for the same reason.
+//
+// Sweep on the six practice cases (backtest3.py, full grid): v1's uniform
+// shrink 0.7 scores 0.323229. Per-tau symmetric shrink (0.5/0.85/0.85) scores
+// 0.316355; the asymmetric outer pair (0.35/0.70) scores 0.310602, improving
+// ALL six cases (p00 0.4818, p01 0.3148, p02 0.4235, p03 0.3436, p04 0.2498,
+// p05 0.1117). The minimum is flat across the neighbourhood (0.3108-0.3125
+// for s_lo 0.30-0.45, s_hi 0.65-0.80), so these are centre-of-flat-region
+// values, not a sharp argmin. VERIFIED on this file itself: running main.ts
+// on the six practice inputs scores exactly 0.310602 with the same per-case
+// numbers, so the TypeScript matches the Python model; two runs are
+// byte-identical and each case takes ~0.6 s (cap 8 s). Rejected after honest
+// testing: a 24h/72h window mix (best 0.321992 alone, no gain on top of
+// per-tau shrink) and an explicit post-up-jump downward drift (every variant
+// worse, up to 0.39 — the pooled conditional mean does not survive at
+// checkpoints).
 //
 // Deterministic: no randomness, no network, no clock reads; two runs on the
 // same case write the same bytes.
@@ -46,8 +54,11 @@ const QUANTILES = [0.05, 0.25, 0.5, 0.75, 0.95];
 const HGRID = [1, 2, 3, 5, 8, 12, 20, 30, 45, 70, 105, 160, 240];
 /** Minutes of history used per market (24 hours). */
 const HIST_WIN = 1440;
-/** Shrinkage of the empirical quantiles toward zero width (0.7 = keep 30%). */
-const SHRINK = 0.7;
+/** Shrinkage of each empirical quantile toward zero width, by tau
+ *  (0.05 / 0.25 / 0.50 / 0.75 / 0.95): the lower tail is kept wide (falls are
+ *  persistent), the upper tail is shrunk hard (rises revert), the middle is
+ *  shrunk hardest (most mass sits at zero change). */
+const SHRINK = [0.35, 0.8, 0.85, 0.9, 0.7];
 
 interface CaseMarket {
   id: string;
@@ -88,7 +99,7 @@ function empQuantiles(prices: number[]): number[][] {
     const ch: number[] = new Array(n - h);
     for (let i = 0; i < n - h; i++) ch[i] = (p[i + h] as number) - (p[i] as number);
     ch.sort((a, b) => a - b);
-    out.push(QUANTILES.map((t) => quantileSorted(ch, t) * (1 - SHRINK)));
+    out.push(QUANTILES.map((t, j) => quantileSorted(ch, t) * (1 - (SHRINK[j] as number))));
   }
   return out;
 }
